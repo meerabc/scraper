@@ -1,0 +1,13 @@
+{
+  "name": "scraper",
+  "version": "1.0.0",
+  "description": "A polite scraper for books.toscrape.com — FlyRank Internship W5 A9",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
