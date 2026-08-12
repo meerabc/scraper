@@ -1,9 +1,11 @@
 import fs from "fs/promises";
 import path from "path";
 import * as cheerio from "cheerio";
+import { z } from "zod";
 
 const USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/meerabc/scraper)";
 const CACHE_DIR = "cache";
+const OUTPUT_DIR = "output";
 const TIMEOUT_MS = 8000;
 const DELAY_MS = 500;
 
@@ -33,7 +35,8 @@ async function fetchPage(url, cacheFile) {
     throw new Error(`Failed fetch: ${url} returned status ${res.status}`);
   }
 
-  const html = await res.text();
+  const buffer = await res.arrayBuffer();
+  const html = new TextDecoder("utf-8").decode(buffer);
   await fs.mkdir(CACHE_DIR, { recursive: true });
   await fs.writeFile(cachePath, html, "utf-8");
   console.log(`FETCH ${cacheFile} (${html.length} bytes)`);
@@ -92,14 +95,48 @@ function extractRecord(html, productUrl, sourcePage) {
   };
 }
 
+function normalizeRecord(raw) {
+  const priceGbp = parseFloat(raw.price_text.replace(/[^0-9.]/g, ""));
+  return { ...raw, price_gbp: priceGbp };
+}
+
+const BookSchema = z.object({
+  title: z.string().min(1),
+  product_url: z.string().url(),
+  price_text: z.string().min(1),
+  price_gbp: z.number().positive(),
+  availability_text: z.string().min(1),
+  rating_text: z.string().min(1),
+  description: z.string().nullable(),
+  source_page: z.string().url(),
+  fetched_at: z.string(),
+});
+
 const catalogue = await discoverCatalogue();
 console.log(`catalogue_pages=${catalogue.catalogue_pages} discovered=${catalogue.urls.size} unique_urls=${catalogue.urls.size}`);
 
-const records = [];
+const validRecords = [];
+const errors = [];
+const seenUrls = new Set();
+
 for (const [url, sourcePage] of catalogue.urls) {
   const html = await fetchPage(url, urlToCacheName(url));
-  records.push(extractRecord(html, url, sourcePage));
+  const raw = extractRecord(html, url, sourcePage);
+  const normalized = normalizeRecord(raw);
+
+  if (seenUrls.has(normalized.product_url)) continue;
+  seenUrls.add(normalized.product_url);
+
+  const result = BookSchema.safeParse(normalized);
+  if (result.success) {
+    validRecords.push(result.data);
+  } else {
+    errors.push({ product_url: url, reason: result.error.issues.map((i) => i.message).join("; ") });
+  }
 }
 
-console.log(records[0]);
-console.log(`detail_pages=${records.length}`);
+await fs.mkdir(OUTPUT_DIR, { recursive: true });
+await fs.writeFile(path.join(OUTPUT_DIR, "books.json"), JSON.stringify(validRecords, null, 2));
+await fs.writeFile(path.join(OUTPUT_DIR, "errors.json"), JSON.stringify(errors, null, 2));
+
+console.log(`valid=${validRecords.length} invalid=${errors.length}`);
