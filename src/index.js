@@ -8,9 +8,28 @@ const CACHE_DIR = "cache";
 const OUTPUT_DIR = "output";
 const TIMEOUT_MS = 8000;
 const DELAY_MS = 500;
+const RETRY_DELAY_MS = 1500;
+
+// Set true only to prove Stage 5 works, then set back to false.
+const INJECT_FAKE_URL = false;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+const stats = { pagesFetched: 0, cacheHits: 0 };
+
+async function fetchOnce(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      headers: { "User-Agent": USER_AGENT },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchPage(url, cacheFile) {
@@ -18,27 +37,33 @@ async function fetchPage(url, cacheFile) {
 
   try {
     const cached = await fs.readFile(cachePath, "utf-8");
+    stats.cacheHits++;
     console.log(`CACHE HIT ${cacheFile} (${cached.length} bytes)`);
     return cached;
   } catch {}
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetchOnce(url);
+  } catch {
+    await sleep(RETRY_DELAY_MS);
+    res = await fetchOnce(url);
+  }
 
-  const res = await fetch(url, {
-    headers: { "User-Agent": USER_AGENT },
-    signal: controller.signal,
-  });
-  clearTimeout(timer);
+  if (res.status >= 500) {
+    await sleep(RETRY_DELAY_MS);
+    res = await fetchOnce(url);
+  }
 
   if (res.status !== 200) {
-    throw new Error(`Failed fetch: ${url} returned status ${res.status}`);
+    throw new Error(`status ${res.status}`);
   }
 
   const buffer = await res.arrayBuffer();
   const html = new TextDecoder("utf-8").decode(buffer);
   await fs.mkdir(CACHE_DIR, { recursive: true });
   await fs.writeFile(cachePath, html, "utf-8");
+  stats.pagesFetched++;
   console.log(`FETCH ${cacheFile} (${html.length} bytes)`);
   await sleep(DELAY_MS);
   return html;
@@ -62,6 +87,10 @@ async function discoverCatalogue(maxPages = 3) {
     const nextHref = $(".next a").attr("href");
     pageUrl = nextHref ? new URL(nextHref, pageUrl).href : null;
     pageNum++;
+  }
+
+  if (INJECT_FAKE_URL) {
+    bookUrls.set("https://books.toscrape.com/catalogue/this-book-does-not-exist_0/index.html", pageUrl);
   }
 
   return { catalogue_pages: pageNum - 1, urls: bookUrls };
@@ -112,15 +141,26 @@ const BookSchema = z.object({
   fetched_at: z.string(),
 });
 
+const startTime = Date.now();
+
 const catalogue = await discoverCatalogue();
 console.log(`catalogue_pages=${catalogue.catalogue_pages} discovered=${catalogue.urls.size} unique_urls=${catalogue.urls.size}`);
 
 const validRecords = [];
 const errors = [];
 const seenUrls = new Set();
+let failedPages = 0;
 
 for (const [url, sourcePage] of catalogue.urls) {
-  const html = await fetchPage(url, urlToCacheName(url));
+  let html;
+  try {
+    html = await fetchPage(url, urlToCacheName(url));
+  } catch (err) {
+    failedPages++;
+    errors.push({ product_url: url, reason: `fetch failed: ${err.message}` });
+    continue;
+  }
+
   const raw = extractRecord(html, url, sourcePage);
   const normalized = normalizeRecord(raw);
 
@@ -139,4 +179,15 @@ await fs.mkdir(OUTPUT_DIR, { recursive: true });
 await fs.writeFile(path.join(OUTPUT_DIR, "books.json"), JSON.stringify(validRecords, null, 2));
 await fs.writeFile(path.join(OUTPUT_DIR, "errors.json"), JSON.stringify(errors, null, 2));
 
-console.log(`valid=${validRecords.length} invalid=${errors.length}`);
+const report = {
+  start_time: new Date(startTime).toISOString(),
+  duration_ms: Date.now() - startTime,
+  pages_fetched: stats.pagesFetched,
+  cache_hits: stats.cacheHits,
+  valid_records: validRecords.length,
+  invalid_records: errors.length,
+  failed_pages: failedPages,
+};
+await fs.writeFile(path.join(OUTPUT_DIR, "run-report.json"), JSON.stringify(report, null, 2));
+
+console.log(`valid=${validRecords.length} invalid=${errors.length} failed_pages=${failedPages}`);
