@@ -42,7 +42,7 @@ async function fetchPage(url, cacheFile) {
 }
 
 async function discoverCatalogue(maxPages = 3) {
-  const bookUrls = new Set();
+  const bookUrls = new Map();
   let pageUrl = "https://books.toscrape.com/catalogue/page-1.html";
   let pageNum = 1;
 
@@ -52,7 +52,8 @@ async function discoverCatalogue(maxPages = 3) {
 
     $(".product_pod h3 a").each((_, el) => {
       const href = $(el).attr("href");
-      bookUrls.add(new URL(href, pageUrl).href);
+      const full = new URL(href, pageUrl).href;
+      bookUrls.set(full, pageUrl);
     });
 
     const nextHref = $(".next a").attr("href");
@@ -60,8 +61,45 @@ async function discoverCatalogue(maxPages = 3) {
     pageNum++;
   }
 
-  return { catalogue_pages: pageNum - 1, urls: [...bookUrls] };
+  return { catalogue_pages: pageNum - 1, urls: bookUrls };
 }
 
-const result = await discoverCatalogue();
-console.log(`catalogue_pages=${result.catalogue_pages} discovered=${result.urls.length} unique_urls=${result.urls.length}`);
+function urlToCacheName(url) {
+  const slug = url.split("/").filter(Boolean).slice(-2, -1)[0];
+  return `book-${slug}.html`;
+}
+
+function extractRecord(html, productUrl, sourcePage) {
+  const $ = cheerio.load(html);
+
+  const title = $(".product_main h1").text().trim();
+  const priceText = $(".product_main .price_color").first().text().trim();
+  const availabilityText = $(".product_main .availability").text().trim().replace(/\s+/g, " ");
+  const ratingClass = $(".product_main .star-rating").attr("class") || "";
+  const ratingText = ratingClass.replace("star-rating", "").trim();
+  const descEl = $("#product_description").next("p");
+  const description = descEl.length ? descEl.text().trim() : null;
+
+  return {
+    title,
+    product_url: productUrl,
+    price_text: priceText,
+    availability_text: availabilityText,
+    rating_text: ratingText,
+    description,
+    source_page: sourcePage,
+    fetched_at: new Date().toISOString(),
+  };
+}
+
+const catalogue = await discoverCatalogue();
+console.log(`catalogue_pages=${catalogue.catalogue_pages} discovered=${catalogue.urls.size} unique_urls=${catalogue.urls.size}`);
+
+const records = [];
+for (const [url, sourcePage] of catalogue.urls) {
+  const html = await fetchPage(url, urlToCacheName(url));
+  records.push(extractRecord(html, url, sourcePage));
+}
+
+console.log(records[0]);
+console.log(`detail_pages=${records.length}`);
